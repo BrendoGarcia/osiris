@@ -1,0 +1,87 @@
+name: Deploy OSIRIS to Google Cloud Run
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION }}
+  SERVICE: osiris
+  GAR_REPOSITORY: osiris
+  IMAGE: osiris
+
+jobs:
+  deploy:
+    name: Build and deploy OSIRIS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Ensure Artifact Registry repository exists
+        run: |
+          gcloud artifacts repositories describe "${{ env.GAR_REPOSITORY }}" \
+            --location="${{ env.REGION }}" \
+            --project="${{ env.PROJECT_ID }}" >/dev/null 2>&1 || \
+          gcloud artifacts repositories create "${{ env.GAR_REPOSITORY }}" \
+            --repository-format=docker \
+            --location="${{ env.REGION }}" \
+            --project="${{ env.PROJECT_ID }}"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE }}:${{ github.sha }}" \
+            --tag "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE }}:latest" \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE }}:${{ github.sha }}"
+          docker push "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE }}:latest"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${{ env.SERVICE }}" \
+            --image "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE }}:${{ github.sha }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --platform managed \
+            --port 3000 \
+            --memory 2Gi \
+            --cpu 2 \
+            --timeout 300 \
+            --concurrency 80 \
+            --min-instances 0 \
+            --max-instances 10 \
+            --allow-unauthenticated
+
+      - name: Show deployed URL
+        run: |
+          gcloud run services describe "${{ env.SERVICE }}" \
+            --region "${{ env.REGION }}" \
+            --project "${{ env.PROJECT_ID }}" \
+            --format='value(status.url)'
